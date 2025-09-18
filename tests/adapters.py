@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import os
+from typing import IO, Any, BinaryIO, Tuple
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from jaxtyping import Float, Int
 
 import numpy.typing as npt
 import torch
-from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+import regex as re
+from collections import defaultdict, Counter
+from typing import Iterator
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
 def run_linear(
@@ -90,7 +96,7 @@ def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys d_k"],
     V: Float[Tensor, " ... values d_v"],
-    mask: Bool[Tensor, " ... queries keys"] | None = None,
+    mask: Float[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
     """
     Given key (K), query (Q), and value (V) tensors, return
@@ -100,7 +106,7 @@ def run_scaled_dot_product_attention(
         Q (Float[Tensor, " ... queries d_k"]): Query tensor
         K (Float[Tensor, " ... keys d_k"]): Key tensor
         V (Float[Tensor, " ... values d_v"]): Values tensor
-        mask (Bool[Tensor, " ... queries keys"] | None): Mask tensor
+        mask (Float[Tensor, " ... queries keys"] | None): Mask tensor
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
@@ -300,7 +306,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $\\Theta$ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -434,9 +440,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     raise NotImplementedError
 
 
-def run_cross_entropy(
-    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
-) -> Float[Tensor, ""]:
+def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
 
@@ -464,7 +468,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
     raise NotImplementedError
 
 
-def get_adamw_cls() -> Any:
+def get_adamw_cls() -> type[torch.optim.Optimizer]:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
@@ -522,7 +526,7 @@ def run_load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-) -> int:
+):
     """
     Given a serialized checkpoint (path or file-like object), restore the
     serialized state to the given model and optimizer.
@@ -537,6 +541,19 @@ def run_load_checkpoint(
         int: the previously-serialized number of iterations.
     """
     raise NotImplementedError
+
+
+def pretokenize(input_text: str, special_tokens: list[str]) -> list[str]:
+    if not special_tokens:
+        return [input_text]
+
+    pattern = r'(' + '|'.join(re.escape(st) for st in sorted(special_tokens, key=len, reverse=True)) + r')'
+    parts = re.split(pattern, input_text)
+    return [p for p in parts if p != '']
+
+
+def get_bytes_list(utf8_string: str) -> tuple[bytes]:
+    return tuple(bytes([s]) for s in utf8_string)
 
 
 def get_tokenizer(
@@ -559,7 +576,93 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+
+    class Tokenizer:
+        def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+            self.vocab = vocab
+            self.inverted_vocab = {v: k for k, v in self.vocab.items()}
+            self.merges = set(merges)
+            self.ranks = {pair: i for i, pair in enumerate(merges)}
+            self.special_tokens = special_tokens if special_tokens else []
+            # print(f'{self.special_tokens=}')
+            # print(f'sadfasdf {"<|endoftext|>".encode("utf-8") in self.vocab.values()}')
+
+        def from_files(cls, vocab_filepath, merges_filepath, special_tokens: list[str] | None = None):
+            pass
+
+        def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+            res = []
+            for s in iterable:
+                res += self.encode(s)
+            return res
+
+        def encode(self, text: str) -> list[int]:
+            if len(text) == 0:
+                return []
+            documents = pretokenize(text, self.special_tokens)
+            result = []
+
+            for doc in documents:
+                if doc in self.special_tokens:
+
+                    result.append(doc.encode('utf-8'))
+                    continue
+
+                regex_tokens = []
+                for match in re.finditer(PAT, doc):
+                    regex_tokens.append(match.group(0))
+
+                for token in regex_tokens:
+                    if len(token) > 0:
+                        bytes_list = get_bytes_list(token.encode('utf-8'))
+
+                        while True:
+                            pairs = [(bytes_list[i], bytes_list[i + 1]) for i in range(len(bytes_list) - 1)]
+                            if not pairs:
+                                break
+
+                            pair_ranks = {pair: self.ranks.get(pair, float('inf')) for pair in pairs}
+                            pair_to_merge = min(pair_ranks, key=pair_ranks.get, default=None)
+
+                            if pair_to_merge is None:
+                                break
+                            if pair_ranks[pair_to_merge] == float('inf'):
+                                break
+
+                        # print(f'pair to merge: {pair_to_merge}')
+                        # if b'\n' in pair_to_merge:
+                        #     print(f'pair to merge: {pair_to_merge}')
+                            i = 0
+                            new_bytes_list = []
+                            while i < len(bytes_list):
+                                if i < len(bytes_list)-1 and (bytes_list[i], bytes_list[i+1]) == pair_to_merge:
+                                    new_bytes_list.append(bytes_list[i] + bytes_list[i+1])
+                                    i += 2
+                                else:
+                                    new_bytes_list.append(bytes_list[i])
+                                    i += 1
+                            bytes_list = new_bytes_list
+                        result += bytes_list
+
+            res = []
+            for b in result:
+                res.append(self.inverted_vocab[b])
+            return res
+
+        def decode(self, ids: list[int]) -> str:
+            if len(ids) == 0:
+                return ''
+
+            try:
+                raw_byte_string = b''.join([self.vocab[i] for i in ids])
+                return raw_byte_string.decode('utf-8')
+            except:
+                return
+
+
+
+    return Tokenizer(vocab, merges, special_tokens)
+
 
 
 def run_train_bpe(
@@ -589,4 +692,56 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    with open(input_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    documents = pretokenize(text, special_tokens)
+    special_bytes = [st.encode('utf-8') for st in special_tokens]
+    counter  = Counter()
+    for doc in documents:
+        if doc in special_tokens:
+            pass
+        else:
+            for token in re.finditer(PAT, doc):
+                counter[get_bytes_list(token.group(0).encode('utf-8'))] += 1
+
+    vocab = {i: token for i, token in enumerate(special_bytes)}
+    vocab |= {len(special_tokens) + i: bytes([i]) for i in range(256)}
+    merges = []
+
+    while len(vocab) < vocab_size:
+        pair_freq = Counter()
+        for w, count in counter.items():
+            for i in range(len(w) - 1):
+                pair = (w[i], w[i+1])
+                pair_freq[pair] += count
+
+        if not pair_freq:
+            break
+        max_freq = max(pair_freq.values())
+        candidates = [p for p, cnt in pair_freq.items() if cnt == max_freq]
+        best_pair = max(candidates)
+        merges.append(best_pair)
+        merged_tok = b''.join(best_pair)
+        new_seqs = Counter()
+        for w, count in counter.items():
+            i = 0
+            new_w = []
+            while i < len(w):
+                if i < len(w) - 1 and w[i:i+2] == best_pair:
+                    new_w.append(merged_tok)
+                    i += 1
+                else:
+                    new_w.append(w[i])
+                i += 1
+            new_seqs[tuple(new_w)] += count
+
+        counter = new_seqs
+        old_size = len(vocab)
+        vocab[len(vocab)]=merged_tok
+        if len(vocab) == old_size:
+            raise Exception
+
+    # print(f'VOCAB:\n{vocab}')
+    # print(f'MERGES:\n{merges}')
+    return vocab, merges
